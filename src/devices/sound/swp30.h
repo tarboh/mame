@@ -272,17 +272,22 @@ private:
 		std::array<s32,     3> m_rw_value;
 		std::array<u8,      3> m_rw_reg;
 		std::array<s32,     3> m_index_value;
-		std::array<bool,    3> m_index_active;
+		std::array<u32,     3> m_index_active;
+		std::array<u32,     3> m_mw_reg_active;
+		std::array<u32,     3> m_rw_reg_active;
 		std::array<s32,     3> m_memw_value;
 		std::array<s32,     3> m_memr_value;
 		std::array<s16,     2> m_t_value;
-		std::array<bool,    3> m_memw_active;
-		std::array<bool,    3> m_memr_active;
+		std::array<u32,     3> m_memw_active;
+		std::array<u32,     3> m_memr_active;
+		std::array<bool,  385> m_skippable;
 		u32                    m_delay_3;
 		u32                    m_delay_2;
 
 		u32 m_ram_read, m_ram_write;
 		s32 m_ram_index;
+		u16 m_skip_to;
+		u32 m_flag_n, m_flag_z;
 		u32 m_sample_counter;
 		u16 m_program_address;
 		u16 m_pc;
@@ -310,15 +315,22 @@ private:
 		static u32 revram_decode(u16 v);
 		static s16 m1_expand(s16 v);
 		static s32 pack24(s64 p);
+		bool branch_taken(u8 cond) const;
+		u16 branch_target(u16 pc) const;
 
 		static void call_rand(void *ms);
 		static void call_revram_encode(void *ms);
 		static void call_revram_decode(void *ms);
 
 		void step();
+		void next_step();
+		void compute_skippable();
 		void drc(drcuml_block &block, u16 pc);
-		void drc_pack24(drcuml_block &block, bool dither, uml::code_label label);
+		void drc_delayed_write_3(drcuml_block &block, u16 src, u16 pc);
+		void drc_delayed_write_2(drcuml_block &block, u16 src, u16 pc);
+		void drc_t_write(drcuml_block &block, u16 pc);
 		void drc_t_value(drcuml_block &block, u32 index2);
+		void drc_pack24(drcuml_block &block, bool dither, uml::code_label label);
 		void reset();
 	};
 

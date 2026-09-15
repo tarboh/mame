@@ -1877,6 +1877,11 @@ void swp30_device::device_start()
 	save_item(STRUCT_MEMBER(*m_meg, m_delay_2));
 	save_item(STRUCT_MEMBER(*m_meg, m_sample_counter));
 	save_item(STRUCT_MEMBER(*m_meg, m_retval));
+	save_item(STRUCT_MEMBER(*m_meg, m_mw_reg_active));
+	save_item(STRUCT_MEMBER(*m_meg, m_rw_reg_active));
+	save_item(STRUCT_MEMBER(*m_meg, m_skip_to));
+	save_item(STRUCT_MEMBER(*m_meg, m_flag_n));
+	save_item(STRUCT_MEMBER(*m_meg, m_flag_z));
 }
 
 void swp30_device::meg_state::reset()
@@ -1891,6 +1896,9 @@ void swp30_device::meg_state::reset()
 	m_ram_read = 0;
 	m_ram_write = 0;
 	m_ram_index = 0;
+	m_skip_to = 0;
+	m_flag_n = 0;
+	m_flag_z = 0;
 	m_program_address = 0;
 	m_pc = 0;
 	std::fill(m_m.begin(), m_m.end(), 0);
@@ -1907,6 +1915,8 @@ void swp30_device::meg_state::reset()
 	std::fill(m_memw_active.begin(),  m_memw_active.end(),  0);
 	std::fill(m_memr_value.begin(),   m_memr_value.end(),   false);
 	std::fill(m_memr_active.begin(),  m_memr_active.end(),  0);
+	std::fill(m_mw_reg_active.begin(),  m_mw_reg_active.end(),  0);
+	std::fill(m_rw_reg_active.begin(),  m_rw_reg_active.end(),  0);
 	m_delay_3 = 0;
 	m_delay_2 = 0;
 	m_sample_counter = 0;
@@ -2916,13 +2926,17 @@ void swp30_device::mixer_step(const std::array<s32, 0x40> &samples_per_chan)
 
 //    33333333 33333333 22222222 22222222 11111111 11111111 00000000 00000000
 //    fedcba98 76543210 fedcba98 76543210 fedcba98 76543210 fedcba98 76543210
-//    ABCDEFFF Grrrrrrr HHHmmmmm m-IIT-J- KKLLMMNN OOPPQRrr rrrrrSmm mmmm----
+//    ABCDEFFF Grrrrrrr HHHmmmmm m-IIT-JU KKLLMMNN OOPPQRrr rrrrrSmm mmmm----
 //    +                               + +                                ++++ = bits set at least once in the mu100 programs
 
 //    m = low is read port, high is write port, memory register
 //    r = low is read port, high is write port, regular register
 
-//    A = seems to disable writing to p and nothing else? Used for lo-fi variation only
+//    A = branch: the step does nothing else, but when the condition in
+//        bits 18-1f holds the following steps up to the target in bits
+//        10-17 (in the same 256 steps) do nothing either.  Condition:
+//        always if bit 3 is clear, otherwise n if bit 2 is set, !n if
+//        clear, or'ed with z if bit 1 is set
 //    B = set index to p
 //    C = set mem write register to p
 //    D = temp register write enable
@@ -2932,6 +2946,7 @@ void swp30_device::mixer_step(const std::array<s32, 0x40> &samples_per_chan)
 //    H = m register write source (0, 1, 3 unknown, 2 lfo, 4 mem read, 5 rand, 6 p, 7 m register)
 //    I = memory mode, none/read/write/read+1
 //    J = add index to address on memory access
+//    U = keep the n (negative) and z (zero) flags of the alu result
 //    T = memory read at an absolute address: offset (+ index) (+1), without
 //        the sample counter and the mappings.  The firmware uploads lookup
 //        tables there through the revram address/data registers (waveforms,
@@ -2941,8 +2956,8 @@ void swp30_device::mixer_step(const std::array<s32, 0x40> &samples_per_chan)
 //    L = shift left writing to p
 //    M = adder mode (0 = add, 1 = sub, 2 = add abs, 3 = binary and)
 //    N = a selector (0=p, 1=r, 2=m, 3=0)
-//    O = multiplier mode (0=off, 1=m1, 2=m1*m2, 3=m2)
-//    P = mul 1st input = 0,3=constant, 1,2=temp register (note that 2 and 3 seem never used)
+//    O = multiplier mode (0=off, 1=m1, 2=m1*m2, 3=m2), the adder, shift and saturation apply even when off
+//    P = mul 1st input = 0,3=constant, 1=temp register, 2=temp register if n, constant otherwise
 //    Q = expand 1st input
 //    R = mul 2nd input = 0=r, 1=m
 //    S = disable dithering when copying from p
@@ -3243,10 +3258,16 @@ offs_t swp30_disassembler::disassemble(std::ostream &stream, offs_t pc, const da
 	int dr = BIT(opcode, 0x30, 7);
 	int t  = BIT(opcode, 0x38, 3);
 
+	if(BIT(opcode, 0x3f)) {
+		u8 cond = BIT(opcode, 0x18, 8);
+		const char *c = !BIT(cond, 3) ? "" : !BIT(cond, 2) ? " if p >= 0" : BIT(cond, 1) ? " if p <= 0" : " if p < 0";
+		append(r, util::string_format("skip to %03x%s", (pc & ~0xff) | BIT(opcode, 0x10, 8), c));
+	}
+
 	u32 mmode = BIT(opcode, 0x16, 2);
-	if(mmode != 0 && !BIT(opcode, 0x3f)) {
+	if(!BIT(opcode, 0x3f) && (mmode != 0 || BIT(opcode, 0x1a, 6))) {
 		u32 m1t = BIT(opcode, 0x14, 2);
-		std::string mul1 = m1t == 1 || m1t == 2 ? util::string_format("t%x", BIT(opcode, 0x38, 3)) : gconst(pc);
+		std::string mul1 = m1t == 1 ? util::string_format("t%x", BIT(opcode, 0x38, 3)) : m1t == 2 ? util::string_format("(n ? t%x : %s)", BIT(opcode, 0x38, 3), gconst(pc)) : gconst(pc);
 		if(BIT(opcode, 0x13))
 			mul1 = util::string_format("exp(%s)", mul1);
 
@@ -3276,6 +3297,9 @@ offs_t swp30_disassembler::disassemble(std::ostream &stream, offs_t pc, const da
 
 		std::string op;
 		switch(mmode) {
+		case 0:
+			op = "0";
+			break;
 		case 1:
 			op = util::string_format("(%s << 8)", mul1);
 			break;
@@ -3313,6 +3337,8 @@ offs_t swp30_disassembler::disassemble(std::ostream &stream, offs_t pc, const da
 		static const char *const satmode[4] = { "=", "=s", "=_", "=a" };
 
 		append(r, util::string_format("p %s %s", satmode[sat], o));
+		if(BIT(opcode, 0x20))
+			append(r, "flags");
 	}
 
 	if(dm) {
@@ -3437,6 +3463,22 @@ void swp30_device::meg_state::drc_t_value(drcuml_block &block, u32 index2)
 	UML_STORE(block, m_t_value.data(), index2, I0, SIZE_WORD, SCALE_x2);
 }
 
+bool swp30_device::meg_state::branch_taken(u8 cond) const
+{
+	if(!BIT(cond, 3))
+		return true;
+	bool c = BIT(cond, 2) ? m_flag_n : !m_flag_n;
+	if(BIT(cond, 1))
+		c = c || m_flag_z;
+	return c;
+}
+
+u16 swp30_device::meg_state::branch_target(u16 pc) const
+{
+	u16 target = (pc & ~0xff) | BIT(m_program[pc], 0x10, 8);
+	return target > 0x180 ? 0x180 : target;
+}
+
 void swp30_device::meg_state::drc(drcuml_block &block, u16 pc)
 {
 	enum {
@@ -3447,40 +3489,33 @@ void swp30_device::meg_state::drc(drcuml_block &block, u16 pc)
 		L_M1_M5,   // m1 expansion, exp < 5
 		L_LFO1,    // lfo, first label
 		L_LFO2,    // lfo, second label
+		L_HEAD,    // start of the step, branch target
+		L_M1_C,    // m1 selection by the n flag, constant
+		L_M1_T,    // m1 selection by the n flag, end
 		L_PACK_M,  // truncation towards zero, m write
 		L_PACK_R,  // truncation towards zero, r write
+		L_TAKEN,   // branch taken
+		L_NOT,     // branch not taken
 	};
+	UML_LABEL(block, (pc << 4) | L_HEAD);
+
+	if(pc == 384)
+		// End of the sample, target of branches skipping to the end
+		return;
 
 	UML_DEBUG(block, pc);
 
-	u64 opcodep3 = m_program[(pc + 384 - 3) % 384];
-	u64 opcodep2 = m_program[(pc + 384 - 2) % 384];
+	// Store the m, r and index registers at the third instruction
+	drc_delayed_write_3(block, (pc + 384 - 3) % 384, pc);
+
+	// Store the memw and memr registers at the second instruction
+	drc_delayed_write_2(block, (pc + 384 - 2) % 384, pc);
+
 	u64 opcode   = m_program[pc];
 	u64 opcode2  = m_program[(pc +       2) % 384];
 	u32 index3 = pc % 3;
 	u32 index2 = pc % 2;
-
-	// Store the m register at the third instruction
-	int delayed_md = BIT(opcodep3, 0x27, 6);
-	if(delayed_md)
-		UML_MOV(block, mem(&m_m[delayed_md]), mem(&m_mw_value[index3]));
-
-	// Store the r register at the third instruction
-	int delayed_rd = BIT(opcodep3, 0x30, 7);
-	if(delayed_rd)
-		UML_MOV(block, mem(&m_r[delayed_rd]), mem(&m_rw_value[index3]));
-
-	// Store the index register at the third instruction
-	if(BIT(opcodep3, 0x3e))
-		UML_MOV(block, mem(&m_ram_index), mem(&m_index_value[index3]));
-
-	// Store the memw register at the second instruction
-	if(BIT(opcodep2, 0x3d))
-		UML_MOV(block, mem(&m_ram_write), mem(&m_memw_value[index2]));
-
-	// Store the memr register at the second instruction
-	if(BIT(opcodep2, 0x25))
-		UML_MOV(block, mem(&m_ram_read), mem(&m_memr_value[index2]));
+	bool gated = m_skippable[pc];
 
 	int sm = BIT(opcode, 0x04, 6);
 	int sr = BIT(opcode, 0x0b, 7);
@@ -3488,15 +3523,59 @@ void swp30_device::meg_state::drc(drcuml_block &block, u16 pc)
 	int dr = BIT(opcode, 0x30, 7);
 	int t  = BIT(opcode, 0x38, 3);
 
+	if(BIT(opcode, 0x3f)) {
+		// Branch, only the temporary register is written
+		drc_t_write(block, pc);
+		if(BIT(opcode2, 0x3b, 2) == 3)
+			drc_t_value(block, index2);
+
+		u8 cond = BIT(opcode, 0x18, 8);
+		if(BIT(cond, 3)) {
+			if(BIT(cond, 1)) {
+				UML_CMP(block, mem(&m_flag_z), 0);
+				UML_JMPc(block, COND_NZ, (pc << 4) | L_TAKEN);
+			}
+			UML_CMP(block, mem(&m_flag_n), 0);
+			UML_JMPc(block, BIT(cond, 2) ? COND_Z : COND_NZ, (pc << 4) | L_NOT);
+		}
+		UML_LABEL(block, (pc << 4) | L_TAKEN);
+		u16 target = branch_target(pc);
+		if(target > pc) {
+			// Writes from the steps before the branch that would have
+			// happened in the skipped zone
+			for(u16 src = pc >= 2 ? pc - 2 : 0; src != pc; src++) {
+				if(src + 3 < target)
+					drc_delayed_write_3(block, src, pc);
+				if(src + 2 < target && src == pc - 1)
+					drc_delayed_write_2(block, src, pc);
+			}
+			// The skipped steps still refresh the t value source
+			for(u16 s = pc + 1; s < target; s++)
+				if(s + 2 >= target && BIT(m_program[(s + 2) % 384], 0x3b, 2) == 3)
+					drc_t_value(block, s % 2);
+			UML_JMP(block, (target << 4) | L_HEAD);
+		}
+		UML_LABEL(block, (pc << 4) | L_NOT);
+		return;
+	}
+
 	u32 mmode = BIT(opcode, 0x16, 2);
-	// Without a multiplier the adder, shift and saturation still apply
-	if(!BIT(opcode, 0x3f) && (mmode != 0 || BIT(opcode, 0x1a, 6))) {
+	if(mmode != 0 || BIT(opcode, 0x1a, 6)) {
 		u32 m1t = BIT(opcode, 0x14, 2);
 		if(mmode == 1 || mmode == 2) {
 			// Needs m1
-			if(m1t == 1 || m1t == 2)
+			if(m1t == 1)
 				UML_DLOADS(block, I1, m_t.data(), t, SIZE_WORD, SCALE_x2);
-			else
+			else if(m1t == 2) {
+				// t when the last flagged result was negative, constant otherwise
+				UML_CMP(block, mem(&m_flag_n), 0);
+				UML_JMPc(block, COND_Z, (pc << 4) | L_M1_C);
+				UML_DLOADS(block, I1, m_t.data(), t, SIZE_WORD, SCALE_x2);
+				UML_JMP(block, (pc << 4) | L_M1_T);
+				UML_LABEL(block, (pc << 4) | L_M1_C);
+				UML_DLOADS(block, I1, m_const.data(), pc, SIZE_WORD, SCALE_x2);
+				UML_LABEL(block, (pc << 4) | L_M1_T);
+			} else
 				UML_DLOADS(block, I1, m_const.data(), pc, SIZE_WORD, SCALE_x2);
 			if(BIT(opcode, 0x13)) {
 				// m1_expand inline
@@ -3543,6 +3622,7 @@ void swp30_device::meg_state::drc(drcuml_block &block, u16 pc)
 
 		switch(mmode) {
 		case 0:
+			// No multiplier, the rest of the chain still runs
 			UML_DMOV(block, I0, 0);
 			break;
 		case 1:
@@ -3651,6 +3731,15 @@ void swp30_device::meg_state::drc(drcuml_block &block, u16 pc)
 		}
 
 		UML_DMOV(block, mem(&m_p), I0);
+
+		if(BIT(opcode, 0x20)) {
+			// Keep the flags for the branches
+			UML_DCMP(block, I0, 0);
+			UML_SETc(block, COND_L, I1);
+			UML_SETc(block, COND_Z, I2);
+			UML_MOV(block, mem(&m_flag_n), I1);
+			UML_MOV(block, mem(&m_flag_z), I2);
+		}
 	}
 
 	if(dm) {
@@ -3724,6 +3813,8 @@ void swp30_device::meg_state::drc(drcuml_block &block, u16 pc)
 			UML_MOV(block, mem(&m_mw_value[index3]), mem(&m_m[sm]));
 			break;
 		}
+		if(gated)
+			UML_MOV(block, mem(&m_mw_reg_active[index3]), 1);
 	}
 
 	if(dr) {
@@ -3736,16 +3827,12 @@ void swp30_device::meg_state::drc(drcuml_block &block, u16 pc)
 			drc_pack24(block, !BIT(opcode, 0x0a), (pc << 4) | L_PACK_R);
 			UML_MOV(block, mem(&m_rw_value[index3]), I0);
 		}
+		if(gated)
+			UML_MOV(block, mem(&m_rw_reg_active[index3]), 1);
 	}
 
 	// T write lookups the p value from two cycles before
-	if(BIT(opcode, 0x3b, 1)) {
-		if(BIT(opcode, 0x3c))
-			UML_LOADS(block, I0, m_t_value.data(), index2, SIZE_WORD, SCALE_x2);
-		else
-			UML_LOADS(block, I0, m_const.data(), pc, SIZE_WORD, SCALE_x2);
-		UML_STORE(block, m_t.data(), t, I0, SIZE_WORD, SCALE_x2);
-	}
+	drc_t_write(block, pc);
 	if(BIT(opcode2, 0x3b, 2) == 3) {
 		if(BIT(opcode, 0x3e)) {
 			UML_DSAR(block, I0, mem(&m_p), 8);
@@ -3758,11 +3845,15 @@ void swp30_device::meg_state::drc(drcuml_block &block, u16 pc)
 	if(BIT(opcode, 0x3d)) {
 		UML_DSAR(block, I0, mem(&m_p), 15);
 		UML_MOV(block, mem(&m_memw_value[index2]), I0);
+		if(gated)
+			UML_MOV(block, mem(&m_memw_active[index2]), 1);
 	}
 
 	if(BIT(opcode, 0x3e)) {
 		UML_DSAR(block, I0, mem(&m_p), 15+8);
 		UML_MOV(block, mem(&m_index_value[index3]), I0);
+		if(gated)
+			UML_MOV(block, mem(&m_index_active[index3]), 1);
 	}
 
 	// Memory access
@@ -3777,16 +3868,16 @@ void swp30_device::meg_state::drc(drcuml_block &block, u16 pc)
 		u32 mask = (1 << (10+BIT(mapr, 8, 3))) - 1;
 		u32 base = BIT(mapr, 0, 8) << 10;
 		UML_LOAD(block, I0, m_offset.data(), pc/3, SIZE_WORD, SCALE_x2);
-		if(amem == 3)
-			UML_ADD(block, I0, I0, 1);
 		if(BIT(opcode, 0x21))
 			UML_ADD(block, I0, I0, mem(&m_ram_index));
+		if(amem == 3)
+			UML_ADD(block, I0, I0, 1);
 		if(amem != 1 && BIT(opcode, 0x23))
-			// Absolute address, no sample counter and no bank mapping
+			// Absolute address, no sample counter and no mapping
 			UML_AND(block, I0, I0, 0x3ffff);
 		else {
+			// Relative to the sample counter, masked within the bank
 			UML_SUB(block, I0, I0, mem(&m_sample_counter));
-			// Mask within the bank, then move to the bank start
 			UML_AND(block, I0, I0, mask);
 			if(base)
 				UML_ADD(block, I0, I0, base);
@@ -3801,8 +3892,121 @@ void swp30_device::meg_state::drc(drcuml_block &block, u16 pc)
 			UML_MOV(block, mem(&m_retval), I1);
 			UML_CALLC(block, call_revram_decode, this);
 			UML_MOV(block, mem(&m_memr_value[index2]), mem(&m_retval));
+			if(gated)
+				UML_MOV(block, mem(&m_memr_active[index2]), 1);
 		}
 	}
+}
+
+// Delayed m, r and index writes of step src, executed at step pc.
+// When src may be skipped by a branch, the write only happens if src
+// actually ran.
+
+void swp30_device::meg_state::drc_delayed_write_3(drcuml_block &block, u16 src, u16 pc)
+{
+	enum { L_W_M, L_W_R, L_W_IDX };
+	u64 opcode = m_program[src];
+	if(BIT(opcode, 0x3f))
+		return;
+	u32 index3 = src % 3;
+	bool gated = m_skippable[src];
+	// Labels are unique per (src, pc) pair, pc < 387 and pc - src < 4
+	uml::code_label base = 0x100000 | (pc << 8) | (((pc - src) & 0xf) << 4);
+
+	int dm = BIT(opcode, 0x27, 6);
+	if(dm) {
+		if(gated) {
+			UML_CMP(block, mem(&m_mw_reg_active[index3]), 0);
+			UML_JMPc(block, COND_Z, base | L_W_M);
+			UML_MOV(block, mem(&m_mw_reg_active[index3]), 0);
+		}
+		UML_MOV(block, mem(&m_m[dm]), mem(&m_mw_value[index3]));
+		if(gated)
+			UML_LABEL(block, base | L_W_M);
+	}
+
+	int dr = BIT(opcode, 0x30, 7);
+	if(dr) {
+		if(gated) {
+			UML_CMP(block, mem(&m_rw_reg_active[index3]), 0);
+			UML_JMPc(block, COND_Z, base | L_W_R);
+			UML_MOV(block, mem(&m_rw_reg_active[index3]), 0);
+		}
+		UML_MOV(block, mem(&m_r[dr]), mem(&m_rw_value[index3]));
+		if(gated)
+			UML_LABEL(block, base | L_W_R);
+	}
+
+	if(BIT(opcode, 0x3e)) {
+		if(gated) {
+			UML_CMP(block, mem(&m_index_active[index3]), 0);
+			UML_JMPc(block, COND_Z, base | L_W_IDX);
+			UML_MOV(block, mem(&m_index_active[index3]), 0);
+		}
+		UML_MOV(block, mem(&m_ram_index), mem(&m_index_value[index3]));
+		if(gated)
+			UML_LABEL(block, base | L_W_IDX);
+	}
+}
+
+// Delayed memw and memr latching of step src, executed at step pc
+
+void swp30_device::meg_state::drc_delayed_write_2(drcuml_block &block, u16 src, u16 pc)
+{
+	enum { L_W_MEMW = 8, L_W_MEMR };
+	u64 opcode = m_program[src];
+	if(BIT(opcode, 0x3f))
+		return;
+	u32 index2 = src % 2;
+	bool gated = m_skippable[src];
+	uml::code_label base = 0x100000 | (pc << 8) | (((pc - src) & 0xf) << 4);
+
+	if(BIT(opcode, 0x3d)) {
+		if(gated) {
+			UML_CMP(block, mem(&m_memw_active[index2]), 0);
+			UML_JMPc(block, COND_Z, base | L_W_MEMW);
+			UML_MOV(block, mem(&m_memw_active[index2]), 0);
+		}
+		UML_MOV(block, mem(&m_ram_write), mem(&m_memw_value[index2]));
+		if(gated)
+			UML_LABEL(block, base | L_W_MEMW);
+	}
+
+	if(BIT(opcode, 0x25)) {
+		if(gated) {
+			UML_CMP(block, mem(&m_memr_active[index2]), 0);
+			UML_JMPc(block, COND_Z, base | L_W_MEMR);
+			UML_MOV(block, mem(&m_memr_active[index2]), 0);
+		}
+		UML_MOV(block, mem(&m_ram_read), mem(&m_memr_value[index2]));
+		if(gated)
+			UML_LABEL(block, base | L_W_MEMR);
+	}
+}
+
+void swp30_device::meg_state::drc_t_write(drcuml_block &block, u16 pc)
+{
+	u64 opcode = m_program[pc];
+	if(BIT(opcode, 0x3b)) {
+		if(BIT(opcode, 0x3c))
+			UML_LOADS(block, I0, m_t_value.data(), pc % 2, SIZE_WORD, SCALE_x2);
+		else
+			UML_LOADS(block, I0, m_const.data(), pc, SIZE_WORD, SCALE_x2);
+		UML_STORE(block, m_t.data(), BIT(opcode, 0x38, 3), I0, SIZE_WORD, SCALE_x2);
+	}
+}
+
+// Steps that a branch may skip
+
+void swp30_device::meg_state::compute_skippable()
+{
+	std::fill(m_skippable.begin(), m_skippable.end(), false);
+	for(u16 pc = 0; pc != 384; pc++)
+		if(BIT(m_program[pc], 0x3f)) {
+			u16 target = branch_target(pc);
+			for(u16 s = pc + 1; s < target; s++)
+				m_skippable[s] = true;
+		}
 }
 
 void swp30_device::meg_state::step()
@@ -3824,11 +4028,11 @@ void swp30_device::meg_state::step()
 	// Memory read and write ports are delayed by 2 cycles
 	if(m_memw_active[m_delay_2]) {
 		m_ram_write = m_memw_value[m_delay_2];
-		m_memw_active[m_delay_2] = false;
+		m_memw_active[m_delay_2] = 0;
 	}
 	if(m_memr_active[m_delay_2]) {
 		m_ram_read = m_memr_value[m_delay_2];
-		m_memr_active[m_delay_2] = false;
+		m_memr_active[m_delay_2] = 0;
 	}
 
 	u64 opcode = m_swp->m_program_cache.read_qword(m_pc);
@@ -3839,11 +4043,36 @@ void swp30_device::meg_state::step()
 	int dr = BIT(opcode, 0x30, 7);
 	int t  = BIT(opcode, 0x38, 3);
 
+	if(m_skip_to > m_pc || BIT(opcode, 0x3f)) {
+		// A branch and the steps it skips do nothing, but the pipeline
+		// keeps moving
+		if(m_skip_to <= m_pc) {
+			if(branch_taken(BIT(opcode, 0x18, 8)))
+				m_skip_to = branch_target(m_pc);
+			// The branch still writes the temporary register
+			if(BIT(opcode, 0x3b)) {
+				if(BIT(opcode, 0x3c))
+					m_t[t] = m_t_value[m_delay_2];
+				else
+					m_t[t] = m_const[m_pc];
+			}
+		}
+		m_mw_reg[m_delay_3] = 0;
+		m_rw_reg[m_delay_3] = 0;
+		m_index_active[m_delay_3] = 0;
+		m_memw_active[m_delay_2] = 0;
+		m_t_value[m_delay_2] = s16(std::clamp<s64>(m_p >> (15+8), -0x8000, 0x7fff));
+
+		next_step();
+		return;
+	}
+
 	u32 mmode = BIT(opcode, 0x16, 2);
 	// Without a multiplier the adder, shift and saturation still apply
 	if(mmode != 0 || BIT(opcode, 0x1a, 6)) {
 		u32 m1t = BIT(opcode, 0x14, 2);
-		s64 m1 = m1t == 1 || m1t == 2 ? m_t[t] : m_const[m_pc];
+		// Selection 2 picks t when the last flagged result was negative
+		s64 m1 = m1t == 1 || (m1t == 2 && m_flag_n) ? m_t[t] : m_const[m_pc];
 		if(BIT(opcode, 0x13))
 			m1 = m1_expand(m1);
 
@@ -3895,8 +4124,7 @@ void swp30_device::meg_state::step()
 
 		switch(BIT(opcode, 0x1e, 2)) {
 		case 0:
-			// wrap at 42 bits (27.15), the saturating modes clamp the
-			// unwrapped value
+			// wrap at 42 bits (27.15)
 			r = util::sext(r, 42);
 			break;
 		case 1:
@@ -3911,6 +4139,12 @@ void swp30_device::meg_state::step()
 		}
 
 		m_p = r;
+
+		// Flags for the branches
+		if(BIT(opcode, 0x20)) {
+			m_flag_n = r < 0;
+			m_flag_z = r == 0;
+		}
 	}
 
 	m_mw_reg[m_delay_3] = dm;
@@ -3948,17 +4182,13 @@ void swp30_device::meg_state::step()
 		m_rw_value[m_delay_3] = v;
 	}
 
-	if(BIT(opcode, 0x3d)) {
-		m_memw_active[m_delay_2] = true;
+	m_memw_active[m_delay_2] = BIT(opcode, 0x3d);
+	if(BIT(opcode, 0x3d))
 		m_memw_value[m_delay_2] = m_p >> 15;
-	} else
-		m_memw_active[m_delay_2] = false;
 
-	if(BIT(opcode, 0x3e)) {
-		m_index_active[m_delay_3] = true;
+	m_index_active[m_delay_3] = BIT(opcode, 0x3e);
+	if(BIT(opcode, 0x3e))
 		m_index_value[m_delay_3] = m_p >> (15+8);
-	} else
-		m_index_active[m_delay_3] = false;
 
 	// T write lookups the p value from two cycles before, but which
 	// bits depends on the presence of index setting
@@ -3971,37 +4201,39 @@ void swp30_device::meg_state::step()
 	m_t_value[m_delay_2] = s16(BIT(opcode, 0x3e) ? (m_p >> 8) & 0x7fff : std::clamp<s64>(m_p >> (15+8), -0x8000, 0x7fff));
 
 	// Memory access
+	s32 base = m_offset[m_pc/3] + (BIT(opcode, 0x21) ? m_ram_index : 0);
 	switch(BIT(opcode, 0x24, 2)) {
 	case 1: {
-		u32 address = resolve_address(m_pc, m_offset[m_pc/3] + (BIT(opcode, 0x21) ? m_ram_index : 0) - m_sample_counter);
+		u32 address = resolve_address(m_pc, base - m_sample_counter);
 		if(address != 0xffffffff)
 			m_swp->m_reverb_cache.write_word(address, revram_encode(m_ram_write));
 		break;
 	}
 	case 2: {
-		u32 address = BIT(opcode, 0x23) ?
-			(m_offset[m_pc/3] + (BIT(opcode, 0x21) ? m_ram_index : 0)) & 0x3ffff :
-			resolve_address(m_pc, m_offset[m_pc/3] + (BIT(opcode, 0x21) ? m_ram_index : 0) - m_sample_counter);
+		u32 address = BIT(opcode, 0x23) ? base & 0x3ffff : resolve_address(m_pc, base - m_sample_counter);
 		if(address != 0xffffffff) {
 			u16 val = m_swp->m_reverb_cache.read_word(address);
 			m_memr_value[m_delay_2] = revram_decode(val);
-			m_memr_active[m_delay_2] = true;
+			m_memr_active[m_delay_2] = 1;
 		}
 		break;
 	}
 	case 3: {
-		u32 address = BIT(opcode, 0x23) ?
-			(m_offset[m_pc/3] + (BIT(opcode, 0x21) ? m_ram_index : 0) + 1) & 0x3ffff :
-			resolve_address(m_pc, m_offset[m_pc/3] + (BIT(opcode, 0x21) ? m_ram_index : 0) - m_sample_counter + 1);
+		u32 address = BIT(opcode, 0x23) ? (base + 1) & 0x3ffff : resolve_address(m_pc, base - m_sample_counter + 1);
 		if(address != 0xffffffff) {
 			u16 val = m_swp->m_reverb_cache.read_word(address);
 			m_memr_value[m_delay_2] = revram_decode(val);
-			m_memr_active[m_delay_2] = true;
+			m_memr_active[m_delay_2] = 1;
 		}
 		break;
 	}
 	}
 
+	next_step();
+}
+
+void swp30_device::meg_state::next_step()
+{
 	m_delay_3 ++;
 	if(m_delay_3 == 3)
 		m_delay_3 = 0;
@@ -4013,8 +4245,10 @@ void swp30_device::meg_state::step()
 	m_pc ++;
 	m_icount --;
 
-	if(m_pc == 0x180)
+	if(m_pc == 0x180) {
 		m_pc = 0;
+		m_skip_to = 0;
+	}
 }
 
 void swp30_device::execute_run()
@@ -4025,7 +4259,9 @@ void swp30_device::execute_run()
 			m_meg_program_changed = false;
 			drcuml_block &block(m_drcuml->begin_block(16384));
 			UML_HANDLE(block, *m_meg_drc_entry);
-			for(u16 pc = 0; pc != 384; pc++)
+			m_meg->compute_skippable();
+			// Step 384 is the end of the sample
+			for(u16 pc = 0; pc != 385; pc++)
 				m_meg->drc(block, pc);
 			UML_EXIT(block, 0);
 			block.end();
