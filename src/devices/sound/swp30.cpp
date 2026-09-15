@@ -1877,6 +1877,9 @@ void swp30_device::device_start()
 	save_item(STRUCT_MEMBER(*m_meg, m_delay_2));
 	save_item(STRUCT_MEMBER(*m_meg, m_sample_counter));
 	save_item(STRUCT_MEMBER(*m_meg, m_retval));
+	save_item(STRUCT_MEMBER(*m_meg, m_index2_value));
+	save_item(STRUCT_MEMBER(*m_meg, m_index2_active));
+	save_item(STRUCT_MEMBER(*m_meg, m_ram_index2));
 	save_item(STRUCT_MEMBER(*m_meg, m_mw_reg_active));
 	save_item(STRUCT_MEMBER(*m_meg, m_rw_reg_active));
 	save_item(STRUCT_MEMBER(*m_meg, m_skip_to));
@@ -1896,6 +1899,7 @@ void swp30_device::meg_state::reset()
 	m_ram_read = 0;
 	m_ram_write = 0;
 	m_ram_index = 0;
+	m_ram_index2 = 0;
 	m_skip_to = 0;
 	m_flag_n = 0;
 	m_flag_z = 0;
@@ -1915,6 +1919,8 @@ void swp30_device::meg_state::reset()
 	std::fill(m_memw_active.begin(),  m_memw_active.end(),  0);
 	std::fill(m_memr_value.begin(),   m_memr_value.end(),   false);
 	std::fill(m_memr_active.begin(),  m_memr_active.end(),  0);
+	std::fill(m_index2_value.begin(),   m_index2_value.end(),   0);
+	std::fill(m_index2_active.begin(),  m_index2_active.end(),  0);
 	std::fill(m_mw_reg_active.begin(),  m_mw_reg_active.end(),  0);
 	std::fill(m_rw_reg_active.begin(),  m_rw_reg_active.end(),  0);
 	m_delay_3 = 0;
@@ -2926,7 +2932,7 @@ void swp30_device::mixer_step(const std::array<s32, 0x40> &samples_per_chan)
 
 //    33333333 33333333 22222222 22222222 11111111 11111111 00000000 00000000
 //    fedcba98 76543210 fedcba98 76543210 fedcba98 76543210 fedcba98 76543210
-//    ABCDEFFF Grrrrrrr HHHmmmmm m-IIT-JU KKLLMMNN OOPPQRrr rrrrrSmm mmmm----
+//    ABCDEFFF Grrrrrrr HHHmmmmm m-IITVJU KKLLMMNN OOPPQRrr rrrrrSmm mmmm----
 //    +                               + +                                ++++ = bits set at least once in the mu100 programs
 
 //    m = low is read port, high is write port, memory register
@@ -2939,6 +2945,7 @@ void swp30_device::mixer_step(const std::array<s32, 0x40> &samples_per_chan)
 //        clear, or'ed with z if bit 1 is set
 //    B = set index to p
 //    C = set mem write register to p
+//    B+C = set second index to p
 //    D = temp register write enable
 //    E = temp register write source, 0=const, 1=p
 //    F = temp register number
@@ -2946,6 +2953,7 @@ void swp30_device::mixer_step(const std::array<s32, 0x40> &samples_per_chan)
 //    H = m register write source (0, 1, 3 unknown, 2 lfo, 4 mem read, 5 rand, 6 p, 7 m register)
 //    I = memory mode, none/read/write/read+1
 //    J = add index to address on memory access
+//    V = add second index to address on memory access
 //    U = keep the n (negative) and z (zero) flags of the alu result
 //    T = memory read at an absolute address: offset (+ index) (+1), without
 //        the sample counter and the mappings.  The firmware uploads lookup
@@ -3361,11 +3369,11 @@ offs_t swp30_disassembler::disassemble(std::ostream &stream, offs_t pc, const da
 			append(r, util::string_format("r%02x = p", dr));
 	}
 
-	if(BIT(opcode, 0x3d))
-		append(r, util::string_format("mw = p"));
-
-	if(BIT(opcode, 0x3e))
-		append(r, util::string_format("idx = p"));
+	switch(BIT(opcode, 0x3d, 2)) {
+	case 1: append(r, "mw = p"); break;
+	case 2: append(r, "idx = p"); break;
+	case 3: append(r, "idx2 = p"); break;
+	}
 
 	if(BIT(opcode, 0x3b)) {
 		if(BIT(opcode, 0x3c))
@@ -3380,7 +3388,7 @@ offs_t swp30_disassembler::disassemble(std::ostream &stream, offs_t pc, const da
 	u32 memmode = BIT(opcode, 0x24, 2);
 	if(memmode) {
 		static const char *modes[4] = { nullptr, "w", "r", "1r" };
-		append(r, util::string_format("mem_%s %s%s%s", modes[memmode], memmode != 1 && BIT(opcode, 0x23) ? "@" : "+", goffset(pc/3), BIT(opcode, 0x21) ? "+idx" : ""));
+		append(r, util::string_format("mem_%s %s%s%s%s", modes[memmode], memmode != 1 && BIT(opcode, 0x23) ? "@" : "+", goffset(pc/3), BIT(opcode, 0x21) ? "+idx" : "", BIT(opcode, 0x22) ? "+idx2" : ""));
 	}
 
 	if(opcode == 0)
@@ -3842,18 +3850,27 @@ void swp30_device::meg_state::drc(drcuml_block &block, u16 pc)
 			drc_t_value(block, index2);
 	}
 
-	if(BIT(opcode, 0x3d)) {
+	// Bits 3d and 3e select between memory write, index write and
+	// second index write
+	switch(BIT(opcode, 0x3d, 2)) {
+	case 1:
 		UML_DSAR(block, I0, mem(&m_p), 15);
 		UML_MOV(block, mem(&m_memw_value[index2]), I0);
 		if(gated)
 			UML_MOV(block, mem(&m_memw_active[index2]), 1);
-	}
-
-	if(BIT(opcode, 0x3e)) {
+		break;
+	case 2:
 		UML_DSAR(block, I0, mem(&m_p), 15+8);
 		UML_MOV(block, mem(&m_index_value[index3]), I0);
 		if(gated)
 			UML_MOV(block, mem(&m_index_active[index3]), 1);
+		break;
+	case 3:
+		UML_DSAR(block, I0, mem(&m_p), 15+8);
+		UML_MOV(block, mem(&m_index2_value[index3]), I0);
+		if(gated)
+			UML_MOV(block, mem(&m_index2_active[index3]), 1);
+		break;
 	}
 
 	// Memory access
@@ -3870,6 +3887,8 @@ void swp30_device::meg_state::drc(drcuml_block &block, u16 pc)
 		UML_LOAD(block, I0, m_offset.data(), pc/3, SIZE_WORD, SCALE_x2);
 		if(BIT(opcode, 0x21))
 			UML_ADD(block, I0, I0, mem(&m_ram_index));
+		if(BIT(opcode, 0x22))
+			UML_ADD(block, I0, I0, mem(&m_ram_index2));
 		if(amem == 3)
 			UML_ADD(block, I0, I0, 1);
 		if(amem != 1 && BIT(opcode, 0x23))
@@ -3904,7 +3923,7 @@ void swp30_device::meg_state::drc(drcuml_block &block, u16 pc)
 
 void swp30_device::meg_state::drc_delayed_write_3(drcuml_block &block, u16 src, u16 pc)
 {
-	enum { L_W_M, L_W_R, L_W_IDX };
+	enum { L_W_M, L_W_R, L_W_IDX, L_W_IDX2 };
 	u64 opcode = m_program[src];
 	if(BIT(opcode, 0x3f))
 		return;
@@ -3937,15 +3956,20 @@ void swp30_device::meg_state::drc_delayed_write_3(drcuml_block &block, u16 src, 
 			UML_LABEL(block, base | L_W_R);
 	}
 
-	if(BIT(opcode, 0x3e)) {
+	u32 w = BIT(opcode, 0x3d, 2);
+	if(w == 2 || w == 3) {
+		auto &active = w == 2 ? m_index_active : m_index2_active;
+		auto &value  = w == 2 ? m_index_value  : m_index2_value;
+		auto &reg    = w == 2 ? m_ram_index    : m_ram_index2;
+		int label    = w == 2 ? L_W_IDX        : L_W_IDX2;
 		if(gated) {
-			UML_CMP(block, mem(&m_index_active[index3]), 0);
-			UML_JMPc(block, COND_Z, base | L_W_IDX);
-			UML_MOV(block, mem(&m_index_active[index3]), 0);
+			UML_CMP(block, mem(&active[index3]), 0);
+			UML_JMPc(block, COND_Z, base | label);
+			UML_MOV(block, mem(&active[index3]), 0);
 		}
-		UML_MOV(block, mem(&m_ram_index), mem(&m_index_value[index3]));
+		UML_MOV(block, mem(&reg), mem(&value[index3]));
 		if(gated)
-			UML_LABEL(block, base | L_W_IDX);
+			UML_LABEL(block, base | label);
 	}
 }
 
@@ -3961,7 +3985,7 @@ void swp30_device::meg_state::drc_delayed_write_2(drcuml_block &block, u16 src, 
 	bool gated = m_skippable[src];
 	uml::code_label base = 0x100000 | (pc << 8) | (((pc - src) & 0xf) << 4);
 
-	if(BIT(opcode, 0x3d)) {
+	if(BIT(opcode, 0x3d, 2) == 1) {
 		if(gated) {
 			UML_CMP(block, mem(&m_memw_active[index2]), 0);
 			UML_JMPc(block, COND_Z, base | L_W_MEMW);
@@ -4021,9 +4045,11 @@ void swp30_device::meg_state::step()
 	if(m_rw_reg[m_delay_3])
 		m_r[m_rw_reg[m_delay_3]] = m_rw_value[m_delay_3];
 
-	// Index is similarly delayed
+	// Indexes are similarly delayed
 	if(m_index_active[m_delay_3])
 		m_ram_index = m_index_value[m_delay_3];
+	if(m_index2_active[m_delay_3])
+		m_ram_index2 = m_index2_value[m_delay_3];
 
 	// Memory read and write ports are delayed by 2 cycles
 	if(m_memw_active[m_delay_2]) {
@@ -4060,6 +4086,7 @@ void swp30_device::meg_state::step()
 		m_mw_reg[m_delay_3] = 0;
 		m_rw_reg[m_delay_3] = 0;
 		m_index_active[m_delay_3] = 0;
+		m_index2_active[m_delay_3] = 0;
 		m_memw_active[m_delay_2] = 0;
 		m_t_value[m_delay_2] = s16(std::clamp<s64>(m_p >> (15+8), -0x8000, 0x7fff));
 
@@ -4182,13 +4209,20 @@ void swp30_device::meg_state::step()
 		m_rw_value[m_delay_3] = v;
 	}
 
-	m_memw_active[m_delay_2] = BIT(opcode, 0x3d);
-	if(BIT(opcode, 0x3d))
+	// Bits 3d and 3e select between memory write, index write and
+	// second index write
+	u32 w = BIT(opcode, 0x3d, 2);
+	m_memw_active[m_delay_2] = w == 1;
+	if(w == 1)
 		m_memw_value[m_delay_2] = m_p >> 15;
 
-	m_index_active[m_delay_3] = BIT(opcode, 0x3e);
-	if(BIT(opcode, 0x3e))
+	m_index_active[m_delay_3] = w == 2;
+	if(w == 2)
 		m_index_value[m_delay_3] = m_p >> (15+8);
+
+	m_index2_active[m_delay_3] = w == 3;
+	if(w == 3)
+		m_index2_value[m_delay_3] = m_p >> (15+8);
 
 	// T write lookups the p value from two cycles before, but which
 	// bits depends on the presence of index setting
@@ -4201,7 +4235,7 @@ void swp30_device::meg_state::step()
 	m_t_value[m_delay_2] = s16(BIT(opcode, 0x3e) ? (m_p >> 8) & 0x7fff : std::clamp<s64>(m_p >> (15+8), -0x8000, 0x7fff));
 
 	// Memory access
-	s32 base = m_offset[m_pc/3] + (BIT(opcode, 0x21) ? m_ram_index : 0);
+	s32 base = m_offset[m_pc/3] + (BIT(opcode, 0x21) ? m_ram_index : 0) + (BIT(opcode, 0x22) ? m_ram_index2 : 0);
 	switch(BIT(opcode, 0x24, 2)) {
 	case 1: {
 		u32 address = resolve_address(m_pc, base - m_sample_counter);

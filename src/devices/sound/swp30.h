@@ -273,6 +273,8 @@ private:
 		std::array<u8,      3> m_rw_reg;
 		std::array<s32,     3> m_index_value;
 		std::array<u32,     3> m_index_active;
+		std::array<s32,     3> m_index2_value;
+		std::array<u32,     3> m_index2_active;
 		std::array<u32,     3> m_mw_reg_active;
 		std::array<u32,     3> m_rw_reg_active;
 		std::array<s32,     3> m_memw_value;
@@ -285,7 +287,7 @@ private:
 		u32                    m_delay_2;
 
 		u32 m_ram_read, m_ram_write;
-		s32 m_ram_index;
+		s32 m_ram_index, m_ram_index2;
 		u16 m_skip_to;
 		u32 m_flag_n, m_flag_z;
 		u32 m_sample_counter;
