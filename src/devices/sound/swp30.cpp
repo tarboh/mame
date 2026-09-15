@@ -3132,6 +3132,9 @@ u16 swp30_device::meg_state::lfo_r(offs_t offset)
 
 void swp30_device::meg_state::lfo_w(offs_t offset, u16 data)
 {
+	// Writing restarts the phase
+	if(offset < m_lfo_counter.size())
+		m_lfo_counter[offset] = 0;
 	m_lfo[offset] = data;
 }
 
